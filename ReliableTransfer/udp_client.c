@@ -11,6 +11,11 @@
 #include <netinet/in.h>
 #include <netdb.h> 
 
+// new headers
+#include <time.h>
+#include <limits.h>
+#include <sys/select.h>
+
 #define BUFSIZE 1024
 
 /* 
@@ -21,7 +26,29 @@ void error(char *msg) {
     exit(0);
 }
 
+#include "common.h"
+
+/**
+ * FTP config
+ */
+#define FTP_NUM_COMMANDS 5
+
+struct FTPCmd {
+  const char* name;
+  int requires_arg;
+};
+
+const struct FTPCmd FTP_COMMANDS[FTP_NUM_COMMANDS] = {
+  {"get", 1},
+  {"put", 1},
+  {"delete", 1},
+  {"ls", 0},
+  {"exit", 0}
+};
+
 int main(int argc, char **argv) {
+    srand((unsigned int)time(NULL));
+  
     int sockfd, portno, n;
     int serverlen;
     struct sockaddr_in serveraddr;
@@ -56,21 +83,62 @@ int main(int argc, char **argv) {
 	  (char *)&serveraddr.sin_addr.s_addr, server->h_length);
     serveraddr.sin_port = htons(portno);
 
-    /* get a message from the user */
-    bzero(buf, BUFSIZE);
-    printf("Please enter msg: ");
-    fgets(buf, BUFSIZE, stdin);
+    /**
+     * CLIENT LOOP
+     */
+    struct Link link = {
+      .socket_fd = sockfd,
+      .addr = serveraddr,
+      .addr_len = sizeof(serveraddr)
+    };
 
-    /* send the message to the server */
-    serverlen = sizeof(serveraddr);
-    n = sendto(sockfd, buf, strlen(buf), 0, &serveraddr, serverlen);
-    if (n < 0) 
-      error("ERROR in sendto");
-    
-    /* print the server's reply */
-    n = recvfrom(sockfd, buf, strlen(buf), 0, &serveraddr, &serverlen);
-    if (n < 0) 
-      error("ERROR in recvfrom");
-    printf("Echo from server: %s", buf);
-    return 0;
+    // init GBN state
+    struct GBNP gbn;
+    gbn.link = link;
+    gbn.last_ack_recv = MAX_SEQ_NUM;
+    gbn.last_frame_sent = MAX_SEQ_NUM;
+    gbn.last_frame_recv = MAX_SEQ_NUM;
+    gbn.largest_acceptable_frame = gbn.last_frame_recv + RWS;
+    memset(gbn.send_win, 0, sizeof(gbn.send_win));
+    memset(gbn.recv_win, 0, sizeof(gbn.recv_win));
+
+    // input loop
+    while (1) {
+      // recv user input
+      bzero(buf, BUFSIZE);
+      printf("> ");
+      fgets(buf, BUFSIZE, stdin);
+
+      // ensure null termination
+      buf[strcspn(buf, "\n")] = '\0';
+      const size_t input_size = strlen(buf);
+
+      // verify syntax
+      int valid = 0;
+      for (size_t i = 0; i < FTP_NUM_COMMANDS; i++) {
+        const struct FTPCmd cmd = FTP_COMMANDS[i];
+        const size_t name_size = strlen(cmd.name);
+        size_t min_cmd_size = name_size;
+        if (cmd.requires_arg) {
+          // space + 1 char at least if it takes an argument
+          min_cmd_size += 2;
+        }
+
+        if (input_size >= min_cmd_size && strncmp(buf, cmd.name, name_size) == 0) {
+          valid = 1;
+          break;
+        }
+      }
+      
+      if (valid) {
+        printf("trying send\n");
+        send_str(&gbn, buf);
+      } else {
+        printf("invalid request '%s'\n", buf);
+        continue;
+      }
+
+      recv_str(&gbn, buf, BUFSIZE);
+      printf("response: %s\n", buf);
+    }
 }
