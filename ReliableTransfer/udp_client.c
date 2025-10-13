@@ -40,7 +40,7 @@ ssize_t SENDTO(int fd, void* data, size_t size, int flags, struct sockaddr* addr
     //     return 1;
     // }
 
-    // return sendto(fd, data, size, flags, addr, addr_len);
+    return sendto(fd, data, size, flags, addr, addr_len);
 }
 
 // #include "common.h"
@@ -68,7 +68,7 @@ SeqNo get_next_seq(SeqNo seq) {
   return next_seq;
 }
 
-#define PAYLOAD_SIZE 1024 * 32 // reliable transfer packet size in bytes
+#define PAYLOAD_SIZE 1024 * 16 // reliable transfer packet size in bytes
 #define FRAME_IS_ACK (1<<0)
 #define FRAME_TIMEOUT_MS 500
 struct Frame {
