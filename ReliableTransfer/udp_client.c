@@ -31,6 +31,18 @@ void error(char *msg) {
     exit(0);
 }
 
+
+ssize_t SENDTO(int fd, void* data, size_t size, int flags, struct sockaddr* addr, socklen_t addr_len) {
+    float u = (float)rand() / (float)RAND_MAX;
+    if (u < 0.05) {
+        // fail
+        // printf("|___ DROPPED!\n");
+        return 1;
+    }
+
+    return sendto(fd, data, size, flags, addr, addr_len);
+}
+
 // #include "common.h"
 typedef uint16_t SeqNo;
 #define MAX_SEQ_NUM USHRT_MAX
@@ -45,13 +57,18 @@ void inc_seq(SeqNo* seq) {
   }
 }
 
+SeqNo dec_seq(SeqNo seq) {
+  if (seq == MAX_SEQ_NUM) return 0;
+  return seq-1;
+}
+
 SeqNo get_next_seq(SeqNo seq) {
   SeqNo next_seq = seq;
   inc_seq(&next_seq);
   return next_seq;
 }
 
-#define PAYLOAD_SIZE 128 // reliable transfer packet size in bytes
+#define PAYLOAD_SIZE 512 // reliable transfer packet size in bytes
 #define FRAME_IS_ACK (1<<0)
 #define FRAME_TIMEOUT_MS 1000
 struct Frame {
@@ -137,37 +154,6 @@ int main(int argc, char **argv) {
 	  (char *)&serveraddr.sin_addr.s_addr, server->h_length);
     serveraddr.sin_port = htons(portno);
 
-     /* get a message from the user */
-    // bzero(buf, BUFSIZE);
-    // printf("Please enter msg: ");
-    // fgets(buf, BUFSIZE, stdin);
-
-    /* send the message to the server */
-    // serverlen = sizeof(serveraddr);
-    // n = sendto(sockfd, buf, strlen(buf), 0, &serveraddr, serverlen);
-    // if (n < 0) 
-    //   error("ERROR in sendto");
-    
-    /* print the server's reply */
-    // n = recvfrom(sockfd, buf, strlen(buf), 0, &serveraddr, &serverlen);
-    // if (n < 0) 
-    //   error("ERROR in recvfrom");
-    // printf("Echo from server: %s", buf);
-    // return 0;
-
-    /**
-     * CLIENT LOOP
-     */
-    // init GBN state
-    // struct GBNP gbn;
-    // gbn_init(&gbn, sockfd, &serveraddr);
-
-    // struct Link link;
-    // DBuf dbuf;
-
-    // init_dbuf(&dbuf);
-    // init_link(&link, sockfd, &serveraddr);
-
     // input loop
     SeqNo current_seq = 0;
     SeqNo nfe = 0;
@@ -239,6 +225,7 @@ int main(int argc, char **argv) {
       size_t copy_offset = 0;
       size_t bytes_remaining = sizeof(ClientHeader);
       while (bytes_remaining) {
+        printf("%zu remaining on CMD\n", bytes_remaining);
         // send
         size_t chunk_size = bytes_remaining >= PAYLOAD_SIZE ? PAYLOAD_SIZE : bytes_remaining;
         
@@ -247,9 +234,9 @@ int main(int argc, char **argv) {
         frame_send.flags = 0;
         frame_send.len = chunk_size;
 
-        ssize_t stat = sendto(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &serveraddr, serverlen);
+        ssize_t stat = SENDTO(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &serveraddr, serverlen);
         if (stat < 0) {
-          perror("sendto");
+          perror("SENDTO");
         }
 
         // get ACK
@@ -268,7 +255,19 @@ int main(int argc, char **argv) {
               continue;
             }
             // otherwise, ACK was received
-          } else continue;
+            printf("GOT ACK FOR #%u\n", frame_recv.ack_num);
+          } else {
+            if (frame_recv.flags == 0) {
+              // send ACK for out of order packet
+              frame_send.len = 0;
+              frame_send.flags = FRAME_IS_ACK;
+              frame_send.seq_num = 0;
+              frame_send.ack_num = dec_seq(nfe);
+
+              SENDTO(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &serveraddr, serverlen);
+            }
+            continue;
+          };
         }
 
         // increment
@@ -294,9 +293,9 @@ int main(int argc, char **argv) {
           if (frame_send.len < PAYLOAD_SIZE) last_packet = 1;
           frame_send.seq_num = current_seq;
 
-          ssize_t stat = sendto(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &serveraddr, serverlen);
+          ssize_t stat = SENDTO(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &serveraddr, serverlen);
           if (stat < 0) {
-            perror("sendto");
+            perror("SENDTO");
           }
 
           // get ACK
@@ -316,7 +315,18 @@ int main(int argc, char **argv) {
               }
               // otherwise, ACK was received
               printf("got ack for %u\n", current_seq);
-            } else continue;
+            } else {
+              if (frame_recv.flags == 0) {
+                // send ACK for out of order packet
+                frame_send.len = 0;
+                frame_send.flags = FRAME_IS_ACK;
+                frame_send.seq_num = 0;
+                frame_send.ack_num = dec_seq(nfe);
+
+                SENDTO(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &serveraddr, serverlen);
+              }
+              continue;
+            };
           }
 
           // increment
@@ -342,12 +352,12 @@ int main(int argc, char **argv) {
           frame_send.len = 0;
           frame_send.flags = FRAME_IS_ACK;
           frame_send.seq_num = 0;
-          frame_send.ack_num = frame_recv.seq_num;
+          frame_send.ack_num = dec_seq(nfe);
 
-          ssize_t stat = sendto(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &serveraddr, serverlen);
+          ssize_t stat = SENDTO(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &serveraddr, serverlen);
           
           if (stat < 0) {
-            perror("sendto");
+            perror("SENDTO");
           }
 
           if (frame_recv.seq_num == nfe) {
@@ -397,9 +407,9 @@ int main(int argc, char **argv) {
               frame_send.len = 0;
               frame_send.flags = FRAME_IS_ACK;
               frame_send.seq_num = 0;
-              frame_send.ack_num = frame_recv.seq_num;
+              frame_send.ack_num = dec_seq(nfe);
 
-              sendto(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &serveraddr, serverlen);
+              SENDTO(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &serveraddr, serverlen);
             }
           }
 
