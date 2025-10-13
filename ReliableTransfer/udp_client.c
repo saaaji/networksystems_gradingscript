@@ -33,12 +33,12 @@ void error(char *msg) {
 
 
 ssize_t SENDTO(int fd, void* data, size_t size, int flags, struct sockaddr* addr, socklen_t addr_len) {
-    float u = (float)rand() / (float)RAND_MAX;
-    if (u < 0.05) {
-        // fail
-        // printf("|___ DROPPED!\n");
-        return 1;
-    }
+    // float u = (float)rand() / (float)RAND_MAX;
+    // if (u < 0.05) {
+    //     // fail
+    //     // printf("|___ DROPPED!\n");
+    //     return 1;
+    // }
 
     return sendto(fd, data, size, flags, addr, addr_len);
 }
