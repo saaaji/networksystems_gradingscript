@@ -29,6 +29,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+
 // new headers
 #include <time.h>
 #include <limits.h>
@@ -86,9 +87,9 @@ SeqNo get_next_seq(SeqNo seq) {
   return next_seq;
 }
 
-#define PAYLOAD_SIZE 1024 * 16 // reliable transfer packet size in bytes
+#define PAYLOAD_SIZE 1024 * 24 // reliable transfer packet size in bytes
 #define FRAME_IS_ACK (1<<0)
-#define FRAME_TIMEOUT_MS 500
+#define FRAME_TIMEOUT_MS 50
 struct Frame {
   SeqNo seq_num;
   SeqNo ack_num;
@@ -467,12 +468,29 @@ int main(int argc, char **argv) {
       FILE* f = fopen(hdr.args, "rb");
 
       ServerHeader shdr = {0};
+      // if (f) {
+      //   shdr.flags = SERVER_SUCCESS;
+      //   fseek(f, 0, SEEK_END);
+      //   long size = ftell(f);
+      //   shdr.payload_size = size;
+      //   fseek(f, 0, SEEK_SET);
+      // }
+
+      // faster file IO
+      char *fbuf = NULL;
+      size_t copy_size = 0;
       if (f) {
+        struct stat st;
+        int ret = stat(hdr.args, &st);
+        // printf("RET: %d, %zu\n", ret, st.st_size);
+        if (st.st_size > 0) {
+          fbuf = malloc(st.st_size);
+          fread(fbuf, 1, st.st_size, f);
+        }
+        fclose(f);
+        shdr.payload_size = st.st_size;
         shdr.flags = SERVER_SUCCESS;
-        fseek(f, 0, SEEK_END);
-        long size = ftell(f);
-        shdr.payload_size = size;
-        fseek(f, 0, SEEK_SET);
+        copy_size = st.st_size;
       }
       shdr.flags |= RES_IS_FILE;
 
@@ -522,15 +540,17 @@ int main(int argc, char **argv) {
       current_seq = get_next_seq(current_seq);     
 
       // send actual file!
-      while (shdr.payload_size) {
-        // send
-        int last_packet = 0;
-        size_t old_seek = ftell(f);
-        frame_send.len = fread(frame_send.data, 1, PAYLOAD_SIZE, f);
-        // printf("GOT SEGMENT: %.*s\n", frame_send.len, frame_send.data);
-        fseek(f, old_seek, SEEK_SET);
-        if (frame_send.len < PAYLOAD_SIZE) last_packet = 1;
+      // send ls string
+      size_t copy_offset = 0;
+      size_t bytes_remaining = copy_size;
+      while (copy_offset < copy_size) {
+          // send
+        size_t chunk_size = bytes_remaining >= PAYLOAD_SIZE ? PAYLOAD_SIZE : bytes_remaining;
+        
         frame_send.seq_num = current_seq;
+        memcpy(frame_send.data, fbuf + copy_offset, chunk_size);
+        frame_send.flags = 0;
+        frame_send.len = chunk_size;
 
         ssize_t stat = SENDTO(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &clientaddr, clientlen);
         if (stat < 0) {
@@ -545,6 +565,7 @@ int main(int argc, char **argv) {
         int ret = poll(&pfd, 1, FRAME_TIMEOUT_MS);
         if (ret <= 0) {
           // rentransmit
+          printf("retransmitting ls DATA: %u\n", current_seq);
           continue;
         } else {
           ssize_t stat = recvfrom(sockfd, &frame_recv, sizeof(struct Frame), 0, (struct sockaddr*) &clientaddr, (socklen_t*) &clientlen);
@@ -552,9 +573,10 @@ int main(int argc, char **argv) {
             if (frame_recv.ack_num != current_seq) {
               continue;
             }
+            printf("GOT ls ACK: #%u\n", frame_recv.ack_num);
             // otherwise, ACK was received
           } else {
-            if (frame_recv.flags == 0) {
+              if (frame_recv.flags == 0) {
               // send ACK for out of order packet
               frame_send.len = 0;
               frame_send.flags = FRAME_IS_ACK;
@@ -569,12 +591,63 @@ int main(int argc, char **argv) {
 
         // increment
         current_seq = get_next_seq(current_seq);
-
-        if (!last_packet)
-          fseek(f, old_seek + frame_send.len, SEEK_SET);
-        else
-          break;
+        bytes_remaining -= chunk_size;
+        copy_offset += chunk_size;
       }
+
+      if (fbuf)
+        free(fbuf);
+
+      // while (shdr.payload_size) {
+      //   // send
+      //   int last_packet = 0;
+      //   size_t old_seek = ftell(f);
+      //   frame_send.len = fread(frame_send.data, 1, PAYLOAD_SIZE, f);
+      //   // printf("GOT SEGMENT: %.*s\n", frame_send.len, frame_send.data);
+      //   fseek(f, old_seek, SEEK_SET);
+      //   if (frame_send.len < PAYLOAD_SIZE) last_packet = 1;
+      //   frame_send.seq_num = current_seq;
+
+      //   ssize_t stat = SENDTO(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &clientaddr, clientlen);
+      //   if (stat < 0) {
+      //     perror("SENDTO");
+      //   }
+
+      //   // get ACK
+      //   struct pollfd pfd;
+      //   pfd.fd = sockfd;
+      //   pfd.events = POLLIN;
+
+      //   int ret = poll(&pfd, 1, FRAME_TIMEOUT_MS);
+      //   if (ret <= 0) {
+      //     // rentransmit
+      //     continue;
+      //   } else {
+      //     ssize_t stat = recvfrom(sockfd, &frame_recv, sizeof(struct Frame), 0, (struct sockaddr*) &clientaddr, (socklen_t*) &clientlen);
+      //     if (stat > 0 && frame_recv.flags & FRAME_IS_ACK) {
+      //       if (frame_recv.ack_num != current_seq) {
+      //         continue;
+      //       }
+      //       // otherwise, ACK was received
+      //     } else {
+      //       if (frame_recv.flags == 0) {
+      //         // send ACK for out of order packet
+      //         frame_send.len = 0;
+      //         frame_send.flags = FRAME_IS_ACK;
+      //         frame_send.seq_num = 0;
+      //         frame_send.ack_num = dec_seq(nfe);
+
+      //         SENDTO(sockfd, &frame_send, sizeof(struct Frame), 0, (struct sockaddr*) &clientaddr, clientlen);
+      //       }
+      //       continue;
+      //     };
+      //   }
+
+      //   // increment
+      //   current_seq = get_next_seq(current_seq);
+      // }
+
+      // free(f);
     } else if (strncmp(hdr.cmd_type, "put", hdr.cmd_len) == 0) {
       // receive the file as payload
       // pipe into new file

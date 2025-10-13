@@ -68,9 +68,9 @@ SeqNo get_next_seq(SeqNo seq) {
   return next_seq;
 }
 
-#define PAYLOAD_SIZE 1024 * 16 // reliable transfer packet size in bytes
+#define PAYLOAD_SIZE 1024 * 24 // reliable transfer packet size in bytes
 #define FRAME_IS_ACK (1<<0)
-#define FRAME_TIMEOUT_MS 500
+#define FRAME_TIMEOUT_MS 50
 struct Frame {
   SeqNo seq_num;
   SeqNo ack_num;
@@ -370,6 +370,7 @@ int main(int argc, char **argv) {
 
       if (shdr.flags & SERVER_SUCCESS) {
         printf("> request successful\n");
+        printf("FLAGS %u (%zu)\n", shdr.flags, shdr.payload_size);
         if (shdr.flags & RES_IS_BYE) {
           printf("quitting...\n");
           exit(0);
@@ -388,17 +389,24 @@ int main(int argc, char **argv) {
             output = fopen(hdr.args, "wb");
           }
 
+          char* fbuf = NULL;
+          if (shdr.payload_size > 0) {
+            fbuf = malloc(shdr.payload_size);
+          }
+
           size_t bytes_remaining = shdr.payload_size;
+          size_t offset = 0;
           while (bytes_remaining) {
             ssize_t stat = recvfrom(sockfd, &frame_recv, sizeof(struct Frame), 0, (struct sockaddr*) &serveraddr, (socklen_t*) &serverlen);
-      
             if (stat > 0 && frame_recv.flags == 0) {
               if (frame_recv.seq_num == nfe) {
                 // append to str
-                // memcpy(buf, frame_recv.data, frame_recv.len);
+                memcpy(fbuf + offset, frame_recv.data, frame_recv.len);
                 // printf("writing segment: (%.*s) %zu\n", frame_recv.len, frame_recv.data, frame_recv.len);
-                fwrite(frame_recv.data, sizeof(char), frame_recv.len, output);
+                // fwrite(frame_recv.data, sizeof(char), frame_recv.len, output);
 
+
+                offset += frame_recv.len;
                 bytes_remaining -= frame_recv.len;
                 nfe = get_next_seq(frame_recv.seq_num);
               }
@@ -413,8 +421,15 @@ int main(int argc, char **argv) {
             }
           }
 
+          // fflush(output);
+          // if (output != stdout) fclose(output);
+
+          // batch write
+          fwrite(fbuf, sizeof(char), shdr.payload_size, output);
           fflush(output);
           if (output != stdout) fclose(output);
+
+          if (fbuf) free(fbuf);
         }
       } else {
         printf("> request failed\n");
