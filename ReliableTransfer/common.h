@@ -30,15 +30,6 @@ ssize_t SENDTO(int fd, void* data, size_t size, int flags, struct sockaddr* addr
     return sendto(fd, data, size, flags, addr, addr_len);
 }
 
-/**
- * GBN config
- */
-struct Link {
-  int socket_fd;
-  struct sockaddr_in addr;
-  socklen_t addr_len;
-};
-
 typedef uint16_t SeqNo;
 #define MAX_SEQ_NUM USHRT_MAX
 #define HTONSEQ(seq) htons(seq)
@@ -57,6 +48,26 @@ SeqNo get_next_seq(SeqNo seq) {
   inc_seq(&next_seq);
   return next_seq;
 }
+
+#define PAYLOAD_SIZE 128 // reliable transfer packet size in bytes
+#define FRAME_IS_ACK (1<<0)
+#define FRAME_TIMEOUT_MS 1000
+struct Frame {
+  SeqNo seq_num;
+  SeqNo ack_num;
+  uint8_t flags;
+  uint16_t len;
+  uint8_t data[PAYLOAD_SIZE];
+};
+
+/**
+ * GBN config
+ */
+struct Link {
+  int socket_fd;
+  struct sockaddr_in addr;
+  socklen_t addr_len;
+};
 
 // inclusive dist between s1 and s2
 size_t seq_dist(SeqNo s1, SeqNo s2) {
@@ -85,18 +96,8 @@ int in_window(SeqNo w0, SeqNo w1, SeqNo s) {
   }
 }
 
-#define PAYLOAD_SIZE 128 // reliable transfer packet size in bytes
-#define FRAME_IS_ACK (1<<0)
-#define FRAME_IS_TAIL (1<<1)
 
-struct Frame {
-  SeqNo seq_num;
-  SeqNo ack_num;
-  uint8_t flags;
-  uint16_t len;
-  uint8_t data[PAYLOAD_SIZE];
-};
-
+// #define FRAME_IS_TAIL (1<<1)
 struct SendSlot {
   struct timespec sent_time;
   int acked;
@@ -110,7 +111,6 @@ struct RecvSlot {
 
 #define SWS 5 // send-window-size
 #define RWS 5 // recv-window-size
-#define FRAME_TIMEOUT_MS 1000
 
 #define RING_BUF_SIZE 1024
 struct Ring {

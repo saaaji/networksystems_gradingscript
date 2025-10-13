@@ -33,6 +33,10 @@
 #include <time.h>
 #include <limits.h>
 #include <sys/select.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <poll.h>
+#include <sys/stat.h>
 #include <dirent.h>
 
 #define BUFSIZE 1024
@@ -45,7 +49,57 @@ void error(char *msg) {
   exit(1);
 }
 
-#include "common.h"
+// #include "common.h"
+
+typedef uint16_t SeqNo;
+#define MAX_SEQ_NUM USHRT_MAX
+#define HTONSEQ(seq) htons(seq)
+#define NTOHSEQ(seq) ntohs(seq)
+
+void inc_seq(SeqNo* seq) {
+  if (*seq == MAX_SEQ_NUM) {
+    *seq = 0;
+  } else {
+    (*seq)++;
+  }
+}
+
+SeqNo get_next_seq(SeqNo seq) {
+  SeqNo next_seq = seq;
+  inc_seq(&next_seq);
+  return next_seq;
+}
+
+#define PAYLOAD_SIZE 128 // reliable transfer packet size in bytes
+#define FRAME_IS_ACK (1<<0)
+#define FRAME_TIMEOUT_MS 1000
+struct Frame {
+  SeqNo seq_num;
+  SeqNo ack_num;
+  uint8_t flags;
+  uint16_t len;
+  uint8_t data[PAYLOAD_SIZE];
+};
+
+typedef struct ClientHeader {
+  size_t cmd_len;
+  char cmd_type[16];
+  size_t args_len;
+  char args[128];
+  size_t payload_size;
+} ClientHeader;
+
+#define SERVER_SUCCESS (1<<0)
+#define RES_IS_FILE (1<<1)
+#define RES_IS_STR (1<<2)
+#define RES_IS_BYE (1<<3)
+
+#define MAX_GOODBYE_ATTEMPTS 10
+
+typedef struct ServerHeader {
+  uint8_t flags; // file, string, goodbye
+  size_t payload_size; // size of string, file, etc.
+} ServerHeader;
 
 int main(int argc, char **argv) {
   srand((unsigned int)time(NULL));
