@@ -19,6 +19,7 @@ The provided Makefile:
   - build `server/udp_server` and `client/udp_client`
   - create `server/` and `client/` if needed
   - copy `foo1, foo2, foo3` into `server/`
+    
 Tip: the script calls make clean && make automatically.
 
 ## What the grader expects your program to support
@@ -48,16 +49,25 @@ The grader talks only to the client; the server’s `stdout/stderr` are fully su
 | 6 | **Reliability under netem** | 25     | Restart server/client, apply `tc netem delay X loss Y%`, create \~N MB `server/foo2`, `get foo2`, then hashes must match. qdisc is removed afterward. |
 
 ## Usage
+
+Depending on your implementation (go-back-N or stop-n-wait) and file size, the wait time for reliable file transfer test would be different. 
+
+You have to experiment with those arguments. 
+
+Also, `netem` is a commandline tool on `Ubuntu`, thus you have to run the script on the course VM or your own Ubuntu machine.
+
+Running the script on other OS won't be able to apply packet loss and latency.
+
 Basic run (defaults shown):
 ```
 python3 grade.py \
   --host 127.0.0.1 \
   --port 8000 \
   --timeout 3.0 \
-  --wait 5.0 \
+  --wait 60.0 \
   --delete-wait 1.0 \
   --exit-wait 2.0 \
-  --foo2-size-mb 5 \
+  --foo2-size-mb 2 \
   --loss 5.0 \
   --delay 1ms
 ```
