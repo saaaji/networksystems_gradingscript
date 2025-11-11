@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2
-LIBS = -lssl -lcrypto
+LIBS = -lssl -lcrypto -pthread
 
 TARGET = proxy
 SRCS = proxy.c
