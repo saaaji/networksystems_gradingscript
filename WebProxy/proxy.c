@@ -751,6 +751,7 @@ void fetch_and_cache(char* host, char* uri) {
 
     if (connect(remote_fd, (struct sockaddr*) &remote_addr, sizeof(remote_addr)) < 0) {
         close(remote_fd);
+        fprintf(stderr, "[PRE] could not connect to remote host\n");
         return;
     }
 
@@ -814,15 +815,16 @@ void* prefetch_worker(void*) {
             job = pre_stack[--pre_count];
             has_job = 1;
         }
-        pthread_mutex_unlock(&pre_lock);
 
-        fprintf(stderr, "[PREFETCH] worker has job: %d\n", has_job);
+        // fprintf(stderr, "[PREFETCH] worker has job: %d\n", has_job);
         if (has_job) {
             fetch_and_cache(job.host, job.uri);
-            free_job(&job);
+            free_job(&job);    
+            pthread_mutex_unlock(&pre_lock);
         } else {
+            pthread_mutex_unlock(&pre_lock);
             // busy loop waiting for jobs
-            usleep(1000 * 1000); // 100ms
+            usleep(100 * 1000); // 100ms
         }
     }
 }
