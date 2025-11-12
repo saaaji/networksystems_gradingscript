@@ -507,6 +507,8 @@ int is_cached(DynamicHttpRequest* req, char** cache_path) {
 
     *cache_path = strdup(fullpath);
 
+    fprintf(stderr, "cache key: %s -> %s\n", req->uri, *cache_path);
+
     struct stat st;
     if (stat(fullpath, &st) == 0) {
         // check age
@@ -519,12 +521,312 @@ int is_cached(DynamicHttpRequest* req, char** cache_path) {
     return 0;
 }
 
+#define MIN_LINK_CAP 32
+
+typedef enum {
+    SEEK_HREF = 0,
+    CONSUME_LINK = 1
+} HrefSearchState;
+
+typedef struct {
+    char** links;
+    size_t link_count;
+    size_t link_cap;
+
+    size_t href_progress;
+    char end_char;
+
+    HrefSearchState state;
+} HrefParser;
+
+void init_href_parser(HrefParser* p) {
+    p->state = SEEK_HREF;
+    p->links = NULL;
+    p->link_cap = 0;
+    p->href_progress = 0;
+}
+
+void free_href_parser(HrefParser* p) {
+    if (p->links) {
+        for (size_t i = 0; i < p->link_count; i++) {
+            free(p->links[i]);
+        }
+        free(p->links);
+    }
+}
+
+typedef enum {
+    PRE_NONE = 0,
+    PRE_HTTP = 1,
+    PRE_HTTPS = 2,
+    PRE_REL = 3
+} UriPrefix;
+
+UriPrefix should_prefetch(char* link, size_t len) {
+    if (strncmp(link, "https://", 8) == 0) return PRE_NONE; // skip HTTPS for now
+    if (strncmp(link, "http://", 7) == 0) return PRE_HTTP;
+    
+    // pass relative through
+    if (len >= 1 && (link[0] == '/' || link[0] == '.' || isalnum(link[0])))
+        return PRE_REL;
+
+    return PRE_NONE;
+}
+
+char* format_link(DynamicHttpRequest* root_req, char* first, size_t len, UriPrefix pre) {
+    if (pre == PRE_HTTP) {
+        char* link = (char*) malloc(len + 1);
+        memcpy(link, first, len);
+        link[len] = '\0';
+        return link;
+    } else if (pre == PRE_REL) {
+        // char link_base[2048];
+        // memset(link_base, (int) '\0', sizeof(link_base));
+        
+        if (strncmp(first, "/", 1)) {
+            char* link = (char*) malloc(len + 1);
+            memcpy(link, first, len);
+            link[len] = '\0';
+            return link;
+        } else {
+            // relative
+            const char* p = strstr(root_req->uri, "://");
+            if (p) p = strchr(p + 3, '/'); // look for next slash
+            const char* base_path = p ? p : "/";
+            char base_dir[1024];
+            strncpy(base_dir, base_path, sizeof(base_dir));
+            char* slash = strrchr(base_dir, '/');
+            if (slash) *(slash + 1) = '\0';
+            
+            size_t res_len = strlen(base_dir) + len;
+            char* link = (char*) malloc(res_len + 1);
+            memset(link, (int) '\0', res_len);
+            snprintf(link, res_len, "%s%.*s", base_dir, (int) len, first);
+
+            return link;
+        }
+
+        // char* link = strdup(link_base);
+        // return link;
+    }
+
+    return NULL;
+}
+
+/**
+ * PREFETCH GLOBAL STATE
+ */
+typedef struct {
+    char* host;
+    char* uri;
+} PrefetchJob;
+
+void free_job(PrefetchJob* job) {
+    free(job->host);
+    free(job->uri);
+}
+
+#define MAX_PREFETCH 32
+static PrefetchJob pre_stack[MAX_PREFETCH];
+static size_t pre_count = 0;
+static pthread_mutex_t pre_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// look for and complete links in chunk
+void scrape_links(DynamicHttpRequest* root_req, HrefParser* p, char* str, size_t len) {
+    static const char* href = "href";
+    static const size_t href_len = 4;
+
+    size_t max_search_range = len - href_len;
+
+    for (size_t i = 0; i < max_search_range; i++) {
+        int found_href = 1;
+        if (p->state == SEEK_HREF) {
+            size_t j;
+            for (j = p->href_progress; j < href_len; j++) {
+                if (str[i+j] != href[j]) {
+                    found_href = 0;
+                    break;
+                }
+            }
+
+            if (0 < j && j < href_len && i == max_search_range - 1) {
+                p->href_progress = j;
+            } else {
+                p->href_progress = 0;
+            }
+        }
+
+        if (found_href) {
+            // try to consume link
+            size_t k = 0;
+            if (p->state == SEEK_HREF) {
+                // eat =, whitespace
+                // size_t k = i + href_len;
+                k = i + href_len;
+                while (k < max_search_range && isspace(str[k])) k++;
+                if (str[k] != '=') continue; // malformed
+
+                k++;
+                if (k >= max_search_range) continue;
+                while (k < max_search_range && isspace(str[k])) k++;
+
+                char first_char = str[k];
+                // fprintf(stderr, "FIRST CHAR: %c\n", first_char);
+                char end_char;
+                if (first_char == '\'' || first_char == '\"') end_char = first_char;
+                else end_char = '>';
+                // fprintf(stderr, "end char: %c\n", end_char);
+                p->end_char = end_char;
+            }
+
+            char* last = memchr(str + k + 1, p->end_char, max_search_range - k);
+            
+            if (last) {
+                // fprintf(stderr, "found last: %c\n", *last);
+                i = last - str; // advance index
+                char* first = str + k + 1;
+                
+                size_t link_len = last - first;
+                // char* link = (char*) malloc(link_len + 1);
+                // memcpy(link, first, link_len);
+                // link[link_len] = '\0';
+                
+                // fprintf(stderr, "found link [%d]: %.*s\n", should_prefetch(first, link_len), link_len, first);
+
+                UriPrefix link_type;
+                if ((link_type = should_prefetch(first, link_len)) != PRE_NONE) {
+                    char* link = format_link(root_req, first, link_len, link_type);
+                    // char* link = malloc(link_len + 1);
+
+                    if (link) {
+                        // memcpy(link, first, link_len);
+                        // link[link_len] = '\0';
+                        // fprintf(stderr, "found link: %s\n", link);
+
+                        // queue job
+                        const char* host = query_str_header(root_req, "Host");
+                        pthread_mutex_lock(&pre_lock);
+                        if (pre_count < MAX_PREFETCH) {
+                            PrefetchJob job = {
+                                .uri = link,
+                                .host = strdup(host)
+                            };
+                            pre_stack[pre_count++] = job;
+                        }
+                        pthread_mutex_unlock(&pre_lock);
+                    }
+                }
+
+                p->state = SEEK_HREF;                
+            } else {
+                p->state = CONSUME_LINK;
+            }
+        }
+    }
+}
+
+void fetch_and_cache(char* host, char* uri) {
+    struct hostent* host_info = gethostbyname(host);
+    if (!host_info) {
+        return;
+    }
+
+    if (is_blocked(host)) {
+        return;
+    }
+
+    int remote_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (remote_fd < 0) {
+        return;
+    }
+
+    struct sockaddr_in remote_addr;
+    memset(&remote_addr, 0, sizeof(remote_addr));
+    remote_addr.sin_family = AF_INET;
+    remote_addr.sin_port = htons(80);
+    memcpy(&remote_addr.sin_addr, host_info->h_addr_list[0], host_info->h_length);
+
+    if (connect(remote_fd, (struct sockaddr*) &remote_addr, sizeof(remote_addr)) < 0) {
+        close(remote_fd);
+        return;
+    }
+
+    // prepend with "/" if necessary
+    char canonical_uri[1024];
+    if (strstr(uri, "http://") == uri || strstr(uri, "https://") == uri) {
+        strncpy(canonical_uri, uri, sizeof(canonical_uri) - 1);
+    } else {
+        snprintf(canonical_uri, sizeof(canonical_uri), "http://%s/%s", host, uri);
+    }
+
+    fprintf(stderr, "[PREFETCH] trying: %s @ %s\n", canonical_uri, host);
+    dprintf(
+        remote_fd, 
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Connection: close\r\n"
+        "\r\n",
+        canonical_uri,
+        host
+    );
+
+    try_create_cache();
+    char* cache_path = NULL;
+    DynamicHttpRequest dummy_req = {0};
+    dummy_req.uri = canonical_uri;
+    int cached = is_cached(&dummy_req, &cache_path);
+    
+    if (!cached && remote_fd >= 0) {
+        FILE* cache_entry = fopen(cache_path, "w");
+        if (!cache_entry) {
+            goto pre_cleanup;
+        }
+
+        char buf[4096];
+        ssize_t n;
+        while ((n = recv(remote_fd, buf, sizeof(buf), 0)) > 0) {
+            fwrite(buf, sizeof(char), n, cache_entry);
+        }
+
+        fprintf(stderr, "[PREFETCH] cache entry created for %s (%s)\n", uri, cache_path);
+        if (cache_entry)
+            fclose(cache_entry);
+
+    }
+
+pre_cleanup:
+    free(cache_path);
+    close(remote_fd);
+}
+
+void* prefetch_worker(void*) {
+    while (1) {
+        PrefetchJob job;
+        int has_job = 0;
+
+        pthread_mutex_lock(&pre_lock);
+        if (pre_count > 0) {
+            job = pre_stack[--pre_count];
+            has_job = 1;
+        }
+        pthread_mutex_unlock(&pre_lock);
+
+        if (has_job) {
+            fetch_and_cache(job.host, job.uri);
+            free_job(&job);
+        } else {
+            // busy loop waiting for jobs
+            usleep(100 * 1000); // 100ms
+        }
+    }
+}
+
 void stream_sockets(DynamicHttpRequest* req, int client_fd, int remote_fd) {
     try_create_cache();
     char* cache_path = NULL;
     int cached = is_cached(req, &cache_path);
     
-    struct pollfd pfd = { .fd = remote_fd, .events = POLLIN | POLLERR | POLLHUP | POLLNVAL };
+    // struct pollfd pfd = { .fd = remote_fd, .events = POLLIN | POLLERR | POLLHUP | POLLNVAL };
 
     if (!cached && remote_fd >= 0) {
         FILE* cache_entry = fopen(cache_path, "w");
@@ -533,39 +835,56 @@ void stream_sockets(DynamicHttpRequest* req, int client_fd, int remote_fd) {
             return;
         }
 
-        char buf_remote[CLIENT_BUFFER_SIZE];
-        int done = 0;
-        while (!done) {
-            int ret = poll(&pfd, 1, 1000);
-            if (ret <= 0) break;
+        HrefParser parser = {0};
+        init_href_parser(&parser);
 
-            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                break;
+        DynamicHttpRequest resp = { .type = HTTP_RESPONSE };
+        Buffer resp_buf = { .len = 0 };
+
+        ssize_t n = read_headers(remote_fd, &resp_buf, PROXY_CONNECTION_TIMEOUT_MS);
+        if (n > 0) {
+            ssize_t eoh = http_find_eoh(resp_buf.raw, resp_buf.len);
+            // long content_length = query_int_header_with_default(&resp, "Content-Length", 0);
+            // fprintf(stderr, "RESP CONTENT LENGTH: %ld\n", content_length);
+            if (!OK(http_parse_headers(&resp, resp_buf.raw, resp_buf.len))) {
+                fprintf(stderr, "could not parse headers, closing\n");
+                send_error(client_fd, 500, req->version);
+                return;
             }
 
-            if (pfd.revents & POLLIN) {
-                ssize_t n = recv(remote_fd, buf_remote, sizeof(buf_remote), 0);
-                if (n <= 0) {
-                    done = 1;
-                    break;
-                }
+            // fprintf(stderr, "RESPONSE HEADERS (%ld) -> %zu hdrs\n", (long) n, resp.header_count);
+            // for (size_t i = 0; i < resp.header_count; i++) {
+            //     fprintf(stderr, "%s: %s\n", resp.headers[i].name, resp.headers[i].value);
+            // }
 
-                send(client_fd, buf_remote, n, 0);
-                fwrite(buf_remote, sizeof(char), n, cache_entry);
+            if (eoh > 0) { // double check
+                long content_length = query_int_header_with_default(&resp, "Content-Length", 0);
+                size_t header_len = eoh + 4;
+                size_t to_stream = header_len + content_length;
+                size_t n_sent = 0;
+
+                // fprintf(stderr, "TO_STREAM: %zu (%zu)\n", to_stream, (size_t) content_length);
+
+                // send everything in header + extra
+                ssize_t n = resp_buf.len;
+                do {
+                    send(client_fd, resp_buf.raw, n, 0);
+                    fwrite(resp_buf.raw, sizeof(char), n, cache_entry);
+
+                    scrape_links(req, &parser, resp_buf.raw, n);
+
+                    n_sent += n;
+                } while (
+                    (n = recv(remote_fd, resp_buf.raw, sizeof(resp_buf.raw), 0)) > 0 &&
+                    n_sent < to_stream
+                );
+
+                // fprintf(stderr, "N_SENT: %zu\n", n_sent);
             }
         }
 
-        // fprintf(stderr, "MESSAGE SENT\n");
         if (cache_entry)
             fclose(cache_entry);
-
-        // FILE* meta_entry = fopen(metapath, "w");
-        // if (meta_entry) {
-        //     struct timespec ts;
-        //     clock_gettime(CLOCK_MONOTONIC, &ts);
-        //     fprintf(meta_entry, "%ld.%09ld\n", ts.tv_sec, ts.tv_nsec);
-        //     fclose(meta_entry);
-        // }
 
         fprintf(stderr, "cache entry should be written\n");
     } else if (cached) {
@@ -597,6 +916,7 @@ void stream_sockets(DynamicHttpRequest* req, int client_fd, int remote_fd) {
 
         close(cache_fd);
     } else {
+        fprintf(stderr, "no remote and no cache, closing\n");
         send_error(client_fd, 500, req->version);
     }
 
@@ -686,7 +1006,7 @@ void* handle_client(void* c_arg) {
 
         if (connect(remote_fd, (struct sockaddr*) &remote_addr, sizeof(remote_addr)) < 0) {
             // send_error(c->fd, 500, req.version);
-            fprintf(stderr, "could not connect to remote host, trying cache");
+            fprintf(stderr, "could not connect to remote host, trying cache\n");
             close(remote_fd);
             // http_free_request(&req);
             // break;
@@ -779,6 +1099,14 @@ int main(int argc, char* argv[]) {
     }
 
     load_blocklist("./blocklist");
+
+    // create prefetch workers
+    for (size_t i = 0; i < 4; i++) {
+        pthread_t tid;
+        pthread_create(&tid, NULL, prefetch_worker, NULL);
+        pthread_detach(tid);
+    }
+
     while (1) {
         Client* c = (Client*) malloc(sizeof(Client));
         c->len = sizeof(c->addr);
