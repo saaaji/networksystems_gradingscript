@@ -514,6 +514,9 @@ int is_cached(DynamicHttpRequest* req, char** cache_path) {
         // check age
         time_t now = time(NULL);
         int age = now - st.st_mtime; // elapsed since last modified
+
+        fprintf(stderr, "\tentry exists, age = %d (TTL = %ld)\n", age, TTL);
+
         return age < TTL;
     }
 
@@ -701,7 +704,7 @@ void scrape_links(DynamicHttpRequest* root_req, HrefParser* p, char* str, size_t
                     if (link) {
                         // memcpy(link, first, link_len);
                         // link[link_len] = '\0';
-                        // fprintf(stderr, "found link: %s\n", link);
+                        fprintf(stderr, "queueing link: %s\n", link);
 
                         // queue job
                         const char* host = query_str_header(root_req, "Host");
@@ -800,6 +803,8 @@ pre_cleanup:
 }
 
 void* prefetch_worker(void*) {
+    fprintf(stderr, "[PREFETCH] spawning worker\n");
+
     while (1) {
         PrefetchJob job;
         int has_job = 0;
@@ -811,12 +816,13 @@ void* prefetch_worker(void*) {
         }
         pthread_mutex_unlock(&pre_lock);
 
+        fprintf(stderr, "[PREFETCH] worker has job: %d\n", has_job);
         if (has_job) {
             fetch_and_cache(job.host, job.uri);
             free_job(&job);
         } else {
             // busy loop waiting for jobs
-            usleep(100 * 1000); // 100ms
+            usleep(1000 * 1000); // 100ms
         }
     }
 }
